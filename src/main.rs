@@ -20,6 +20,7 @@
 //! ```
 
 #![feature(buf_read_has_data_left)]
+#![feature(seek_stream_len)]
 
 use crate::cli::{InfoParams, MountParams, Subcommands};
 use fuser::MountOption;
@@ -27,6 +28,7 @@ use fuser::MountOption;
 mod cli;
 mod cmd_info;
 mod cmd_mount;
+pub(crate) mod multi_cursor;
 
 fn main() {
     env_logger::init();
