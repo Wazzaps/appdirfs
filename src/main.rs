@@ -7,11 +7,11 @@
 //! AppTrustedHdr
 //! $entries_start = .
 //! Entry[]
-//! .align $block_size  # (Aligned for efficiency, since the b+tree blocks are block-sized)
-//! $bptree_start = .
-//! BPTreeBlock[]
+//! $idxtbl_start = .
+//! PathHash[n]
+//! EntryOffset[n]
+//! .align $block_size  # (Aligned for efficiency, so blocks can be mmap'd)
 //! $data_start = .
-//! # (Already aligned, needed so data access is transparent)
 //! (Data Pool)
 //! # (Already aligned, needed so mmap-ing won't leak data)
 //! (Symlink Pool)
@@ -21,6 +21,7 @@
 
 #![feature(buf_read_has_data_left)]
 #![feature(seek_stream_len)]
+#![allow(clippy::comparison_chain)]
 
 use crate::cli::{InfoParams, MountParams, Subcommands};
 use fuser::MountOption;

@@ -29,6 +29,10 @@ pub struct InfoParams {
     /// appdir file
     #[argh(positional)]
     pub appdir_path: PathBuf,
+
+    /// read the given file inside the archive
+    #[argh(option)]
+    pub read: Option<String>,
 }
 
 #[derive(FromArgs, Debug)]

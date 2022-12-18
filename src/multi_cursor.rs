@@ -51,6 +51,10 @@ impl<'a, F: FileExt> FileSliceCursor<'a, F> {
         self.seek(SeekFrom::Start(new_pos))?;
         Ok(res)
     }
+
+    pub fn len(&self) -> u64 {
+        self.end - self.begin
+    }
 }
 
 impl<'a> FileSliceCursor<'a, File> {

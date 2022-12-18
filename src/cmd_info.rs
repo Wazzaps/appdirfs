@@ -1,10 +1,14 @@
 use crate::multi_cursor::FileSliceCursor;
 use crate::InfoParams;
-use byteorder::{ReadBytesExt, LE};
+use anyhow::bail;
+use byte_slice_cast::AsSliceOf;
+use byteorder::{ByteOrder, ReadBytesExt, LE};
+use sha2::Digest;
+use std::cmp::min;
 use std::fmt::Write as _w2;
 use std::fs::File;
-use std::io::Write as _w1;
 use std::io::{BufRead, BufReader, Read, Seek};
+use std::io::{SeekFrom, Write as _w1};
 use std::os::unix::fs::FileExt;
 
 pub type BytesTupleVec = Vec<(Vec<u8>, Vec<u8>)>;
@@ -96,7 +100,7 @@ pub struct AppTrustedHdr {
     block_size_pow: u8,
     block_size: u32,
     entries_size: u32,
-    bptree_size: u32,
+    idxtbl_size: u32,
     required_flags: u64,
     optional_flags: u64,
     name: Vec<u8>,
@@ -130,13 +134,9 @@ impl AppTrustedHdr {
             let block_size = 1 << block_size_pow;
             let attrs_size = fd.read_u32::<LE>()?;
             let entries_size = fd.read_u32::<LE>()?;
-            let bptree_size = fd.read_u32::<LE>()?;
-            if bptree_size % block_size != 0 {
-                anyhow::bail!(
-                    "B+Tree size ({}) not aligned to block size ({})",
-                    bptree_size,
-                    block_size
-                );
+            let idxtbl_size = fd.read_u32::<LE>()?;
+            if idxtbl_size % 8 != 0 {
+                anyhow::bail!("Index table size ({}) not aligned to 8", idxtbl_size);
             }
             let required_flags = fd.read_u64::<LE>()?;
 
@@ -164,7 +164,7 @@ impl AppTrustedHdr {
                     block_size_pow,
                     block_size,
                     entries_size,
-                    bptree_size,
+                    idxtbl_size,
                     required_flags,
                     optional_flags,
                     name,
@@ -219,7 +219,7 @@ pub struct AppdirParser<'a, F: FileExt> {
     entries_start: u64,
     sig_hdr: AppSignatureHdr,
     hdr: AppTrustedHdr,
-    bptree_start: u64,
+    idxtbl_start: u64,
     data_start: u64,
     supplied_hash: Option<Vec<u8>>,
     supplied_signature: Option<Vec<u8>>,
@@ -243,19 +243,19 @@ impl<'a, F: FileExt> AppdirParser<'a, F> {
                     } else {
                         anyhow::bail!(
                             "Unknown compression type `{}`",
-                            String::from_utf8_lossy(&*attr_val)
+                            String::from_utf8_lossy(&attr_val)
                         );
                     }
                 }
                 attr_name => {
-                    println!("WARNING: Unknown attribute {:?}", attr_name);
+                    println!("WARNING: Unknown attribute {attr_name:?}");
                 }
             }
         }
 
         let (hdr, trusted_attrs) = AppTrustedHdr::parse(&mut fd)?;
         for (attr_name, _attr_val) in trusted_attrs {
-            println!("WARNING: Unknown trusted attribute {:?}", attr_name);
+            println!("WARNING: Unknown trusted attribute {attr_name:?}");
         }
 
         let padding_start = sig_hdr.hdr_size + sig_hdr.pre_padding_size;
@@ -265,27 +265,22 @@ impl<'a, F: FileExt> AppdirParser<'a, F> {
             (val + mask) & !mask
         }
 
-        let bptree_start = if compression {
+        let data_start = if compression {
             // There's no padding when using compression (useless)
             padding_start as u64
         } else {
             align_up_blksize(padding_start as u64, hdr.block_size_pow)
         };
 
-        let data_start = if compression {
-            // There's no alignment when using compression (useless)
-            bptree_start + hdr.bptree_size as u64
-        } else {
-            align_up_blksize(bptree_start + hdr.bptree_size as u64, hdr.block_size_pow)
-        };
-
         let entries_start = fd.stream_position()?;
+
+        let idxtbl_start = entries_start + hdr.entries_size as u64;
         Ok(Self {
             fd,
             entries_start,
             sig_hdr,
             hdr,
-            bptree_start,
+            idxtbl_start,
             data_start,
             supplied_hash,
             supplied_signature,
@@ -293,7 +288,7 @@ impl<'a, F: FileExt> AppdirParser<'a, F> {
         })
     }
 
-    pub fn entries(&mut self) -> anyhow::Result<()> {
+    pub fn entries(&self) -> anyhow::Result<()> {
         let mut stdout = std::io::stdout().lock();
         self.fd
             .slice(self.entries_start..self.entries_start + self.hdr.entries_size as u64)
@@ -379,13 +374,171 @@ impl<'a, F: FileExt> AppdirParser<'a, F> {
 
                     // Push dir names to name stack
                     if entry.entry_type == 4 {
-                        dir_name_stack.push(String::from_utf8_lossy(&*entry.name).to_string());
+                        dir_name_stack.push(String::from_utf8_lossy(&entry.name).to_string());
                     }
                 }
                 Ok(())
             })?;
 
         Ok(())
+    }
+
+    fn full_path_of(
+        &self,
+        entry: &Entry,
+        res: &mut Vec<u8>,
+        max_depth: usize,
+    ) -> anyhow::Result<()> {
+        if max_depth == 0 {
+            bail!("Malformed appdir: recursive directories");
+        }
+
+        if entry.parent_entry != 0xffffffff {
+            let parent = self.lookup_by_entry_offset(entry.parent_entry as u64)?;
+            self.full_path_of(&parent, res, max_depth - 1)?;
+            res.push(b'/');
+        }
+        res.extend_from_slice(&entry.name);
+        Ok(())
+    }
+
+    fn lookup_by_entry_offset(&self, entry_offset: u64) -> anyhow::Result<Entry> {
+        self.fd
+            .slice(self.entries_start..self.entries_start + self.hdr.entries_size as u64)
+            .with_buffering(|entry_reader| {
+                entry_reader.seek(SeekFrom::Start(entry_offset))?;
+                Entry::parse(entry_reader)
+            })
+    }
+
+    pub fn lookup_by_path(&self, path: &[u8]) -> anyhow::Result<Entry> {
+        const KEY_SIZE_BYTES: u64 = 4;
+        const VAL_SIZE_BYTES: u64 = 4;
+        const INITIAL_SEARCH_RADIUS: u64 = 32; // TODO: Tweak
+
+        if self.hdr.idxtbl_size == 0 {
+            bail!("No index table (or empty appdir)");
+        }
+
+        // Create constrained file slices
+        let search_space = self
+            .fd
+            .slice(self.idxtbl_start..self.idxtbl_start + (self.hdr.idxtbl_size / 2) as u64);
+        let mut value_space = self.fd.slice(
+            self.idxtbl_start + (self.hdr.idxtbl_size / 2) as u64
+                ..self.idxtbl_start + self.hdr.idxtbl_size as u64,
+        );
+
+        // These will contain the indices that all equal the desired key
+        let mut first_key = None;
+        let mut last_key = None;
+
+        // Get the hash of the path
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(path);
+        let hash = &hasher.finalize()[..KEY_SIZE_BYTES as usize];
+        let hash = u32::from_be_bytes(hash.try_into().unwrap());
+
+        // Get approx position
+        let total_items: u32 = (search_space.len() / KEY_SIZE_BYTES).try_into()?;
+        let approx_pos = (hash as u64 * total_items as u64) >> 32;
+
+        // Initial search
+        let initial_search_start =
+            approx_pos.saturating_sub(INITIAL_SEARCH_RADIUS) * KEY_SIZE_BYTES;
+        let initial_search_end = min(
+            (approx_pos + INITIAL_SEARCH_RADIUS) * KEY_SIZE_BYTES,
+            (self.hdr.idxtbl_size / 2) as u64,
+        );
+        let mut initial_search_keys =
+            vec![0u8; (initial_search_end - initial_search_start) as usize];
+        search_space.read_at(&mut initial_search_keys, initial_search_start)?;
+
+        let mut seen_lesser_key = false;
+        let mut seen_higher_key = false;
+        let mut seen_the_key = false;
+
+        let mut initial_search_keys = initial_search_keys.as_slice_of::<u32>()?.to_vec();
+        byteorder::BigEndian::from_slice_u32(initial_search_keys.as_mut_slice());
+
+        // fixme: println!("{} {:?}", hash, initial_search_keys);
+        for (i, key) in initial_search_keys.iter().enumerate() {
+            if first_key.is_some() && last_key.is_some() {
+                // Found, we're done!
+                break;
+            }
+
+            if *key < hash {
+                seen_lesser_key = true;
+            } else if *key == hash {
+                // First key, no need for lower
+                if i == 0 && initial_search_start == 0 {
+                    seen_lesser_key = true;
+                }
+
+                seen_the_key = true;
+                if seen_lesser_key && first_key.is_none() {
+                    first_key = Some(i as u64 + (initial_search_start / KEY_SIZE_BYTES));
+                }
+
+                // Last key, no need for higher
+                if i as u64 * KEY_SIZE_BYTES + initial_search_start
+                    == self.hdr.idxtbl_size as u64 / 2 - KEY_SIZE_BYTES
+                {
+                    seen_higher_key = true;
+                    last_key = Some(i as u64 + (initial_search_start / KEY_SIZE_BYTES));
+                }
+            } else if *key > hash {
+                seen_higher_key = true;
+                if seen_the_key && last_key.is_none() {
+                    last_key = Some(i as u64 + (initial_search_start / KEY_SIZE_BYTES) - 1);
+                }
+            }
+        }
+
+        // TODO: Extend search down
+        // TODO: Extend search up
+
+        if let (Some(first_key), Some(last_key)) = (first_key, last_key) {
+            if first_key == last_key {
+                // Only one key, no need to resolve full path
+                value_space.seek(SeekFrom::Start(first_key * VAL_SIZE_BYTES))?;
+                let entry_offset = value_space.read_u32::<LE>()?;
+                return self.lookup_by_entry_offset(entry_offset as u64);
+            } else {
+                // TODO: Count this as a performance metric
+                // Key collision, need to resolve full path of each entry
+                for key in first_key..=last_key {
+                    value_space.seek(SeekFrom::Start(key * VAL_SIZE_BYTES))?;
+                    let entry_offset = value_space.read_u32::<LE>()?;
+                    let entry = self.lookup_by_entry_offset(entry_offset as u64)?;
+
+                    let mut full_path = vec![];
+                    self.full_path_of(&entry, &mut full_path, 32)?;
+
+                    if full_path == path {
+                        return Ok(entry);
+                    }
+                }
+            }
+        } else {
+            println!("{first_key:?} {last_key:?}");
+        }
+        bail!("todo");
+    }
+
+    pub fn file_slice(&self, entry: &Entry) -> anyhow::Result<FileSliceCursor<'a, F>> {
+        // Make sure it's a file or symlink
+        if entry.entry_type == 8 || entry.entry_type == 10 {
+            let mut slice = self.fd.slice(
+                self.data_start + entry.data_offset
+                    ..self.data_start + entry.data_offset + entry.size,
+            );
+            slice.rewind()?;
+            Ok(slice)
+        } else {
+            bail!("Tried to get file slice of directory")
+        }
     }
 }
 
@@ -401,13 +554,24 @@ fn pretty_print_size(size: u64) -> String {
     } else if size >= 1024 {
         format!("{} KiB", size / 1024)
     } else {
-        format!("{} B  ", size)
+        format!("{size} B  ")
     }
 }
 
 pub fn get_info(info_params: InfoParams) {
     let mut file = File::open(info_params.appdir_path).unwrap();
     let file_slice = FileSliceCursor::from_file(&mut file);
-    let mut parser = AppdirParser::open(file_slice).unwrap();
-    parser.entries().unwrap();
+    let parser = AppdirParser::open(file_slice).unwrap();
+    if let Some(path_to_read) = info_params.read {
+        let entry = parser.lookup_by_path(path_to_read.as_bytes()).unwrap();
+        let mut file_slice = parser.file_slice(&entry).unwrap();
+
+        while file_slice.stream_position().unwrap() < file_slice.stream_len().unwrap() {
+            let mut buf = [0u8; 4096];
+            let count = file_slice.read(&mut buf).unwrap();
+            std::io::stdout().lock().write_all(&buf[..count]).unwrap();
+        }
+    } else {
+        parser.entries().unwrap();
+    }
 }
